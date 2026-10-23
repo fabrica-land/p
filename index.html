@@ -1,53 +1,28 @@
 #!/bin/sh
-# probe-render-v3.sh: ENG-5167 AC2, ASK-237. v1 + the fix for Vacherin's HOLD on v1 choice 1 (s_client -brief yields a
-# connection summary, not the served chain): a per-host exact-SNI full-chain step with bounded per-certificate output.
-# v3 = v2 + the result-boundary fix of Vacherin ruling 774526: a chain step that exits nonzero, or a served chain of
-# more than 10 certificates (output capped at 10), is marked NOT MEASURED and counted in chain_fail (END rc=4).
-# Choices 2-4 (missing-tool STOP 70, fixed service-id preflight 71, distinct final codes) are unchanged from v1.
-#
-# VANTAGE: this result measures STAGING-WEB RENDER EGRESS ONLY: the existing Render shell of web service
-# fabrica-v3-staging (srv-cf41hl02i3mniah6mjk0), opened by a human (Tim), who pastes COMMAND-v3.txt into it.
-# It never measures production, worker-staging, or GitHub-runner egress. It is not run through render-readonly run-job.
-#
-# Paste form (COMMAND-v3.txt): sh -s <<'AC2P_EOF' / this text, byte for byte / AC2P_EOF.
-# Bounds (each a property of this text):
-#  - No file write (no temp file, no PEM file), no env dump, no credential read, no HTTP request (no HTTP client;
-#    s_client stdin is /dev/null, so no application byte is sent), no DB, no app command. Env reads are 5 fixed names
-#    only: RENDER_SERVICE_ID (compared, never printed raw), and RENDER_SERVICE_ID, RENDER_SERVICE_NAME,
-#    RENDER_INSTANCE_ID, RENDER_GIT_COMMIT printed charset-restricted ([A-Za-z0-9._-]) and capped at 64 chars.
-#  - Order: (1) required-tool preflight, shell builtins only (command -v, printf, [ ), before any say, now or rv
-#    call and before any external command. A missing tool prints one fixed STOP line and exits 70, no other output.
-#    (2) vantage check (builtins only): RENDER_SERVICE_ID must be srv-cf41hl02i3mniah6mjk0, else one fixed STOP
-#    line, exit 71, no network step. (3) main, with stdin /dev/null and stderr merged into stdout, piped through
-#    the fail-closed output filter. (4) one FINAL line (printf builtin, integer status).
-#  - Output filter fails closed: every stdout and stderr line of main must match one fixed AC2P line shape (W[] in
-#    the awk filter), be at most 512 bytes, and must not match the session-material deny list (Master-Key,
-#    Session-ID, session ticket, PSK, resumption, early data, SSL-Session, -----BEGIN/-----END any block, hex dumps);
-#    else the line is replaced by one fixed REDACTED line and the final status is 65. No END line seen = status 66.
-#  - TLS verify steps (tls, tls12) use s_client -brief, as in v1: no SSL-Session block, no PEM, no ticket.
-#  - Chain step (chain): s_client -connect H:443 -servername H -showcerts, once, under the same 30 s cap, no retry.
-#    Its stderr goes to /dev/null and its stdout never reaches output or disk: one pipe keeps only the PEM blocks
-#    of the "Certificate chain" section (session material is dropped inside the pipe, never stored); the blocks are
-#    held in one shell variable. Each block is piped (no file) to openssl x509, whose output is reduced to one line
-#    per certificate: host, index, subject, issuer (RFC 2253, bytes outside [A-Za-z0-9 ._:=,()/*@&+#'-] shown as ?,
-#    each capped at 160 chars) and the SHA-256 fingerprint (shape-checked). At most 10 certificates are shown.
-#    A chain step rc other than 0 (including a missing rc marker, read as 255), more than 10 certificates (the first
-#    10 are shown, then one NOT MEASURED truncated line), zero certificates, unbalanced PEM markers, or an
-#    unparseable certificate each mark that host's served chain NOT MEASURED; chain_fail counts each such host once.
-#  - Fixed host list (from v3); the exact hostname is the SNI and the verify name. Port 443 only.
-#  - Per host: DNS (getent ahostsv4/ahostsv6; node dns A/AAAA/CNAME), TCP (nc -z -v), TLS default and TLS 1.2,
-#    each with -servername, -verify_hostname, -verify_return_error, plus an explicit verify verdict, then the chain
-#    step. Every network step runs once under `timeout -k 2 30`; rc 124 = cap hit. No retry. Per-step rc and elapsed
-#    are printed.
-# Exit (= FINAL status): 0 = every step ran, every TLS verify OK, every chain measured, nothing redacted;
-# 3 = every chain measured, at least one TLS verify FAILED (END verify_fail=<n>); 4 = at least one host's served
-# chain NOT measured (chain step rc nonzero, more than 10 certificates, 0 certificates, malformed, or unparseable;
-# END chain_fail=<n>; takes precedence over 3);
-# 65 = a line was redacted; 66 = no END line; 70 = preflight stop (a required tool missing; nothing measured);
-# 71 = vantage stop (not the staging web service; nothing measured).
+# probe-render-v4.sh: ENG-5167 AC2, ASK-237. v4 = v3 (sha256 bde4563f...) + three fixes for the v3 run of
+# 2026-10-23T14:57Z (output stopped after auth.fabrica.land tls12; one REDACTED tcp line; process did not exit):
+#  F1 bounded: every network step runs under a portable sh watchdog (no GNU timeout; background step + sleep/kill,
+#     TERM then KILL after 2 s), stdin /dev/null, cap STEPCAP s; plus a global wall-clock cap WALL s on the whole main.
+#     STEPCAP * 28 steps (+ 2 s grace each) < WALL, so a cap hit on one step never prevents later hosts.
+#  F2 no stream filter stall: main writes to a file in this script's own mktemp dir (mode 700, removed on exit); the
+#     fail-closed filter reads that file after main ends (v3 piped main live into awk; a block-buffering awk can
+#     hold the tail of the output). While main runs, the outer shell prints fixed WAIT lines (integers only).
+#     If WALL is hit: main and the running step are killed; every unfinished host gets one chain NOT MEASURED line,
+#     then one END rc=67 line. END and FINAL are always printed.
+#  F3 tcp: nc's free text is never forwarded (its wording differs per netcat build, and v3's whitelist bracket
+#     expression []...] is parsed differently by some awks). The tcp step prints one fixed line:
+#     tcp|CONNECT <host>:443 rc=<n> result=open|closed|cap-hit. PEER_IP is still derived from nc's text internally.
+# Scope unchanged from v3: same 4 hosts, port 443, same per-host steps (dns4, dns6, dnsrec, tcp, tls, tls12, chain),
+# same verify verdict, same chain bounds (<=10 certs, one line each), same deny list, same vantage/preflight stops.
+# VANTAGE: staging-web Render egress only (fabrica-v3-staging srv-cf41hl02i3mniah6mjk0). No production, no worker.
+# Bounds: no write outside its own mktemp dir; no PEM file (PEM held in a shell variable, as v3); no env dump; no
+# credential read; no HTTP request; no sudo; no cert store change. Env reads: the same 5 names as v3, plus TMPDIR.
+# Exit (= FINAL status): 0 all OK; 3 >=1 TLS verify FAIL; 4 >=1 chain NOT measured (precedence over 3);
+# 65 a line was redacted; 66 no END line; 67 wall-clock cap hit (precedence over 65); 70 preflight stop;
+# 71 vantage stop; 130 interrupted.
 set -u
 P='AC2P'
-REQ='timeout openssl getent nc node awk sed date id tr cut head sha256sum'
+REQ='openssl getent nc node awk sed date id tr cut head sha256sum mktemp sleep rm cat grep chmod'
 MISS=''
 for b in $REQ; do
   command -v "$b" >/dev/null 2>&1 || MISS="$MISS $b"
@@ -62,29 +37,70 @@ if [ "${RENDER_SERVICE_ID:-}" != 'srv-cf41hl02i3mniah6mjk0' ]; then
 fi
 
 HOSTS='auth.fabrica.land cl.imagineapi.dev demo.imagineapi.dev testnets-api.opensea.io'
-CAP=30
+STEPCAP=20
+WALL=720
 NODE_DNS='const d=require("dns").promises,h=process.argv[1];(async()=>{for(const [k,f] of [["A","resolve4"],["AAAA","resolve6"],["CNAME","resolveCname"]]){try{console.log(k,JSON.stringify(await d[f](h)))}catch(e){console.log(k,"ERR",e.code)}}})()'
+
+TD=$(mktemp -d "${TMPDIR:-/tmp}/ac2p4.XXXXXX" </dev/null 2>/dev/null) || TD=''
+if [ -z "$TD" ] || [ ! -d "$TD" ]; then
+  printf '%s|STOP preflight: mktemp -d failed; nothing measured; no network step run\n' "$P"
+  printf '%s|FINAL status=70\n' "$P"
+  exit 70
+fi
+chmod 700 "$TD" 2>/dev/null
+MP=''
+cleanup() {
+  [ -n "$MP" ] && kill "$MP" 2>/dev/null
+  if [ -f "$TD/steppid" ]; then _sp=$(cat "$TD/steppid" 2>/dev/null); [ -n "$_sp" ] && kill -KILL "$_sp" 2>/dev/null; fi
+  rm -rf "$TD" 2>/dev/null
+}
+trap 'cleanup' EXIT
+trap 'cleanup; trap - EXIT; printf "%s|FINAL status=130 (interrupted)\n" "$P"; exit 130' INT TERM HUP
 
 say() { printf '%s|%s\n' "$P" "$*"; }
 now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 rv() { eval "_v=\${$1:-UNSET}"; printf '%s' "$_v" | tr -cd 'A-Za-z0-9._-' | cut -c1-64; }
 
-# run <host> <step> <label> <cmd...>: one attempt, 30 s cap, stdin /dev/null; every output line printed with the
-# host|step prefix (the filter decides); rc + elapsed recorded; output kept in $OUT, rc in $RC.
+# bounded <cap> <tag> <cmd...>: run cmd in the background with stdin /dev/null; a watchdog subshell sends TERM at
+# <cap> s and KILL 2 s later, and leaves marker $TD/cap.<tag>. Returns the cmd rc, or 124 if the watchdog fired.
+bounded() {
+  _cap=$1; _tag=$2; shift 2
+  rm -f "$TD/cap.$_tag"
+  "$@" </dev/null &
+  _cp=$!
+  printf '%s\n' "$_cp" > "$TD/steppid"
+  ( trap 'kill "$_sl" 2>/dev/null; exit 0' TERM
+    sleep "$_cap" & _sl=$!
+    wait "$_sl"
+    : > "$TD/cap.$_tag"
+    kill -TERM "$_cp" 2>/dev/null
+    sleep 2
+    kill -KILL "$_cp" 2>/dev/null ) </dev/null >/dev/null 2>&1 &
+  _wp=$!
+  wait "$_cp" 2>/dev/null; _rc=$?
+  kill -TERM "$_wp" 2>/dev/null
+  wait "$_wp" 2>/dev/null
+  if [ -f "$TD/cap.$_tag" ]; then _rc=124; fi
+  return "$_rc"
+}
+
 OUT=''
 RC=0
 VFAIL=0
 CFAIL=0
 SUMMARY=''
+# run <host> <step> <label> <cmd...>: one attempt, STEPCAP cap; output kept in $OUT, rc in $RC. Output lines are
+# printed with the host|step prefix (the filter decides) unless QUIET=1 (tcp: nc text is never printed).
+QUIET=0
 run() {
   _h=$1; _s=$2; _l=$3; shift 3
   say "$_h|$_s|CMD $_l"
   say "$_h|$_s|UTC $(now)"
   _t0=$(date +%s)
-  OUT=$(timeout -k 2 "$CAP" "$@" </dev/null 2>&1)
+  OUT=$(bounded "$STEPCAP" "$_h.$_s" "$@" 2>&1)
   RC=$?
   _el=$(( $(date +%s) - _t0 ))
-  if [ -n "$OUT" ]; then
+  if [ -n "$OUT" ] && [ "$QUIET" -eq 0 ]; then
     printf '%s\n' "$OUT" | while IFS= read -r _ln; do printf '%s|%s|%s|%s\n' "$P" "$_h" "$_s" "$_ln"; done
   fi
   if [ "$RC" -eq 124 ]; then _x=' CAP-HIT'; else _x=''; fi
@@ -92,7 +108,6 @@ run() {
   SUMMARY="$SUMMARY $_s=$RC"
 }
 
-# verdict <host> <step>: OK only if rc 0 (-verify_return_error) and openssl printed "Verification: OK".
 verdict() {
   _v=$(printf '%s\n' "$OUT" | sed -n 's/^Verification: OK$/OK/p; s/^Verification error:.*/ERROR/p; s/^verify error:.*/ERROR/p' | head -1)
   _n=$(printf '%s\n' "$OUT" | sed -n "s/^Verified peername: $1\$/VERIFIED/p" | head -1)
@@ -102,14 +117,12 @@ verdict() {
   say "$1|$2|PEER_IP ${_ip:-NOT MEASURED (openssl printed no peer address)}"
 }
 
-# chain <host>: the exact-SNI served chain, one attempt, 30 s cap, stdin /dev/null, stderr discarded. The awk keeps
-# only PEM CERTIFICATE blocks inside the "Certificate chain" section plus the rc marker; nothing else is kept.
 chain() {
   _h=$1
   say "$_h|chain|CMD openssl s_client -connect $_h:443 -servername $_h -showcerts"
   say "$_h|chain|UTC $(now)"
   _t0=$(date +%s)
-  _pem=$( { timeout -k 2 "$CAP" openssl s_client -connect "$_h:443" -servername "$_h" -showcerts </dev/null 2>/dev/null
+  _pem=$( { bounded "$STEPCAP" "$_h.chain" openssl s_client -connect "$_h:443" -servername "$_h" -showcerts 2>/dev/null
             printf 'AC2P_RC=%s\n' "$?"; } | LC_ALL=C awk '
     /^AC2P_RC=[0-9]+$/ { r = $0; next }
     d { next }
@@ -173,21 +186,26 @@ chain() {
 
 main() {
   unset NODE_OPTIONS NODE_PATH 2>/dev/null
-  say "BEGIN kit=eng5167-ac2-ask237-render-v3 start=$(now) uid=$(id -u)"
+  say "BEGIN kit=eng5167-ac2-ask237-render-v4 start=$(now) uid=$(id -u)"
   say "VANTAGE render-shell service=$(rv RENDER_SERVICE_ID) name=$(rv RENDER_SERVICE_NAME) instance=$(rv RENDER_INSTANCE_ID) commit=$(rv RENDER_GIT_COMMIT)"
   say "VANTAGE scope=staging-web Render egress only (fabrica-v3-staging srv-cf41hl02i3mniah6mjk0); production and worker egress NOT MEASURED"
   say "REGION NOT MEASURED (the shell supplies no verifiable region)"
+  say "BOUNDS stepcap=${STEPCAP}s grace=2s wall=${WALL}s"
   for b in $REQ; do say "BIN $b=$(command -v "$b")"; done
-  say "OPENSSL $(openssl version 2>&1) | $(openssl version -d 2>&1)"
+  say "OPENSSL $(openssl version </dev/null 2>&1) | $(openssl version -d </dev/null 2>&1)"
   CA=/etc/ssl/certs/ca-certificates.crt
-  if [ -f "$CA" ]; then say "TRUSTSTORE $CA sha256=$(sha256sum "$CA" | cut -c1-64)"; else say "TRUSTSTORE $CA MISSING"; fi
+  if [ -f "$CA" ]; then say "TRUSTSTORE $CA sha256=$(sha256sum "$CA" </dev/null | cut -c1-64)"; else say "TRUSTSTORE $CA MISSING"; fi
   for H in $HOSTS; do
     SUMMARY=''
     say "$H|HOST start=$(now)"
     run "$H" dns4 "getent ahostsv4 $H" getent ahostsv4 "$H"
     run "$H" dns6 "getent ahostsv6 $H" getent ahostsv6 "$H"
     run "$H" dnsrec "node -e NODE_DNS(A,AAAA,CNAME) $H" node -e "$NODE_DNS" "$H"
+    QUIET=1
     run "$H" tcp "nc -z -v -w 10 $H 443" nc -z -v -w 10 "$H" 443
+    QUIET=0
+    if [ "$RC" -eq 0 ]; then _o=open; elif [ "$RC" -eq 124 ]; then _o=cap-hit; else _o=closed; fi
+    say "$H|tcp|CONNECT $H:443 rc=$RC result=$_o"
     _ip=$(printf '%s\n' "$OUT" | sed -n 's/.*(\([0-9A-Fa-f.:]*\)).*/\1/p; s/.*\[\([0-9A-Fa-f.:]*\)\].*/\1/p' | head -1)
     say "$H|tcp|PEER_IP ${_ip:-NOT MEASURED}"
     run "$H" tls "openssl s_client -connect $H:443 -servername $H -verify_hostname $H -verify_return_error -brief" \
@@ -198,6 +216,7 @@ main() {
     verdict "$H" tls12
     chain "$H"
     say "$H|SUMMARY$SUMMARY end=$(now)"
+    printf '%s\n' "$H" >> "$TD/done"
   done
   if [ "$CFAIL" -gt 0 ]; then say "END rc=4 verify_fail=$VFAIL chain_fail=$CFAIL end=$(now)"; return 4; fi
   if [ "$VFAIL" -gt 0 ]; then say "END rc=3 verify_fail=$VFAIL chain_fail=0 end=$(now)"; return 3; fi
@@ -205,7 +224,36 @@ main() {
   return 0
 }
 
-main </dev/null 2>&1 | LC_ALL=C awk '
+# Outer: main in the background, output to the private file; wall-clock watch with fixed WAIT lines.
+: > "$TD/done"
+main </dev/null >"$TD/out" 2>&1 &
+MP=$!
+T0=$(date +%s)
+WC=0
+LASTW=0
+while kill -0 "$MP" 2>/dev/null; do
+  sleep 1
+  EL=$(( $(date +%s) - T0 ))
+  if [ "$EL" -ge "$WALL" ]; then WC=1; break; fi
+  if [ $((EL - LASTW)) -ge 30 ]; then LASTW=$EL; printf '%s|WAIT elapsed=%ss wall=%ss\n' "$P" "$EL" "$WALL"; fi
+done
+if [ "$WC" -eq 1 ]; then
+  kill "$MP" 2>/dev/null
+  _sp=$(cat "$TD/steppid" 2>/dev/null); [ -n "$_sp" ] && kill -KILL "$_sp" 2>/dev/null
+  wait "$MP" 2>/dev/null
+  {
+    printf '\n'
+    for H in $HOSTS; do
+      grep -qx "$H" "$TD/done" 2>/dev/null || say "$H|chain|NOT MEASURED wall-clock cap hit before this host finished"
+    done
+    say "END rc=67 wallcap=hit wall=${WALL}s end=$(now)"
+  } >> "$TD/out"
+else
+  wait "$MP" 2>/dev/null
+fi
+MP=''
+
+LC_ALL=C awk '
 BEGIN {
   H = "(auth[.]fabrica[.]land|cl[.]imagineapi[.]dev|demo[.]imagineapi[.]dev|testnets-api[.]opensea[.]io)"
   T = "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z"
@@ -216,14 +264,16 @@ BEGIN {
   C = "[A-Za-z0-9 ._:=,()/*@&+#\047?-]*"
   FP = ""; for (j = 0; j < 31; j++) FP = FP "[0-9A-F][0-9A-F]:"; FP = FP "[0-9A-F][0-9A-F]"
   n = 0
-  W[++n] = "^AC2P[|]BEGIN kit=eng5167-ac2-ask237-render-v3 start=" T " uid=[0-9]+$"
+  W[++n] = "^AC2P[|]BEGIN kit=eng5167-ac2-ask237-render-v4 start=" T " uid=[0-9]+$"
   W[++n] = "^AC2P[|]VANTAGE render-shell service=" R " name=" R " instance=" R " commit=" R "$"
   W[++n] = "^AC2P[|]VANTAGE scope=staging-web Render egress only [(]fabrica-v3-staging srv-cf41hl02i3mniah6mjk0[)]; production and worker egress NOT MEASURED$"
   W[++n] = "^AC2P[|]REGION NOT MEASURED [(]the shell supplies no verifiable region[)]$"
+  W[++n] = "^AC2P[|]BOUNDS stepcap=[0-9]+s grace=2s wall=[0-9]+s$"
   W[++n] = "^AC2P[|]BIN [a-z0-9]+=/[A-Za-z0-9._/+-]+$"
   W[++n] = "^AC2P[|]OPENSSL [A-Za-z0-9 ._:/()|\"+-]+$"
   W[++n] = "^AC2P[|]TRUSTSTORE /etc/ssl/certs/ca-certificates[.]crt (sha256=[0-9a-f]+|MISSING)$"
   W[++n] = "^AC2P[|]END rc=[0-9]+ verify_fail=[0-9]+ chain_fail=[0-9]+ end=" T "$"
+  W[++n] = "^AC2P[|]END rc=67 wallcap=hit wall=[0-9]+s end=" T "$"
   W[++n] = X "HOST start=" T "$"
   W[++n] = X "SUMMARY dns4=[0-9]+ dns6=[0-9]+ dnsrec=[0-9]+ tcp=[0-9]+ tls=[0-9]+ tls12=[0-9]+ chain=[0-9]+ end=" T "$"
   W[++n] = X "(dns4|dns6|dnsrec|tcp|tls|tls12|chain)[|]CMD [A-Za-z0-9 ._:/(),=-]+$"
@@ -231,7 +281,7 @@ BEGIN {
   W[++n] = X "(dns4|dns6|dnsrec|tcp|tls|tls12|chain)[|]rc=[0-9]+ elapsed=[0-9]+s( CAP-HIT)?$"
   W[++n] = X "dns[46][|]" I " +(STREAM|DGRAM|RAW)( +[A-Za-z0-9.-]+)? *$"
   W[++n] = X "dnsrec[|](A|AAAA|CNAME) ([[](\"[A-Za-z0-9.:-]+\",?)*[]]|ERR [A-Z_]+)$"
-  W[++n] = X "tcp[|][][A-Za-z0-9 ._:()/!,=?-]+$"
+  W[++n] = X "tcp[|]CONNECT " H ":443 rc=[0-9]+ result=(open|closed|cap-hit)$"
   W[++n] = X "tcp[|]PEER_IP (" I "|NOT MEASURED)$"
   W[++n] = X "tls(12)?[|]VERIFY=(OK|FAIL) rc=[0-9]+ verification=(OK|ERROR|NOT_SEEN) peername=(VERIFIED|NOT_SEEN)$"
   W[++n] = X "tls(12)?[|]PEER_IP (" I "|NOT MEASURED [(]openssl printed no peer address[)])$"
@@ -245,9 +295,11 @@ BEGIN {
   W[++n] = X "chain[|]MALFORMED unbalanced certificate block markers; served chain not measured$"
   W[++n] = X "chain[|]NOT MEASURED chain step exited rc=[0-9]+ [(]nonzero[)]; served chain not measured$"
   W[++n] = X "chain[|]NOT MEASURED served chain truncated: count=[0-9]+ shown=10$"
+  W[++n] = X "chain[|]NOT MEASURED wall-clock cap hit before this host finished$"
   D = "master[- ]?(key|secret)|session[- ]?id|ticket|psk|resumption|early data|ssl-session|-----begin|-----end|begin ssl|session param|[0-9a-f][0-9a-f][0-9a-f][0-9a-f] - [0-9a-f][0-9a-f]"
   bad = 0; seen = 0; endrc = 0
 }
+$0 == "" { next }
 {
   l = $0; ok = 0
   if (length(l) <= 512) { for (i = 1; i <= n; i++) if (l ~ W[i]) { ok = 1; break } }
@@ -256,13 +308,15 @@ BEGIN {
     print l
     if (l ~ "^AC2P[|]END rc=") { e = l; sub("^AC2P[|]END rc=", "", e); sub(" .*$", "", e); endrc = e + 0; seen = 1 }
   } else { print "AC2P|REDACTED line withheld (not in the output whitelist)"; bad++ }
-  fflush()
 }
 END {
+  if (seen && endrc == 67) { print "AC2P|FILTER redacted=" bad " status=67 (wall-clock cap)"; exit 67 }
   if (bad > 0) { print "AC2P|FILTER redacted=" bad " status=65"; exit 65 }
   if (!seen) { print "AC2P|FILTER redacted=0 status=66 (no END line)"; exit 66 }
   print "AC2P|FILTER redacted=0 status=" endrc; exit endrc
-}' 2>/dev/null
+}' "$TD/out" 2>/dev/null
 st=$?
+cleanup
+trap - EXIT
 printf '%s|FINAL status=%s\n' "$P" "$st"
 exit "$st"
