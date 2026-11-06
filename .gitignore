@@ -1,0 +1,12 @@
+# No backup copies or local secret files at any depth. Git history and sops are the backup.
+**/*.bak*
+**/*.before*
+**/*.override
+**/.env*
+!**/.env.example
+!**/.env.local.example
+**/local.json*
+
+*.orig
+*~
+*.pre-*
